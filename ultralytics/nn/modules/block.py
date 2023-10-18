@@ -5,12 +5,75 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .conv import Conv, DWConv, GhostConv, LightConv, RepConv
+from torchvision.ops import SqueezeExcitation
+
+from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, DepthwiseSeparableConv, SqueezeExcite
 from .transformer import TransformerBlock
 
 __all__ = ('DFL', 'HGBlock', 'HGStem', 'SPP', 'SPPF', 'C1', 'C2', 'C3', 'C2f', 'C3x', 'C3TR', 'C3Ghost',
-           'GhostBottleneck', 'Bottleneck', 'BottleneckCSP', 'Proto', 'RepC3')
+           'GhostBottleneck', 'Bottleneck', 'BottleneckCSP', 'Proto', 'RepC3'
+           ,'FusedMBConv','MBConv')
 
+
+class FusedMBConv(nn.Module):
+    """Fused MBConv, equivalent to EdgeResidual."""
+
+    def __init__(self, c1, c2, k=3, s=1, p=None, g=1, d=1, act=True, se_ratio=0.25):
+        super(FusedMBConv, self).__init__()
+        self.has_skip = (c1 == c2 and s == 1)
+        self.c2 = c2
+        # Expansion Convolution
+        self.conv_exp = Conv(c1, c2, k=k, s=s, p=p, g=g, d=d, act=act)
+        
+        # Squeeze-and-Excitation
+        self.se = SqueezeExcitation(c2, int(c2*se_ratio))
+        
+        # Point-wise Linear Projection
+        self.conv_pwl = Conv(c2, c2, k=1, act=False)
+
+    def forward(self, x):
+        # print(self.c2)
+        # print(f'x shape: {x.shape}')
+        shortcut = x
+        x = self.conv_exp(x)
+        # print(f'before se shape: {x.shape}')
+        x = self.se(x)
+        x = self.conv_pwl(x)
+        if self.has_skip:
+            x = x + shortcut
+        return x
+
+class MBConv(nn.Module):
+    """MBConv, equivalent to InvertedResidual."""
+
+    def __init__(self, c1, c2, k=3, s=1, expand_ratio=1.0, p=None, g=1, d=1, act=True, se_ratio=0.25):
+        super(MBConv, self).__init__()
+        self.c2 = c2
+        hidden_dim = int(round(c1 * expand_ratio))
+        self.use_res_connect = s == 1 and c1 == c2
+        
+        layers = []
+        if expand_ratio != 1:
+            # Point-wise Expansion
+            layers.append(Conv(c1, hidden_dim, k=1, act=act))
+        
+        layers.extend([
+            # Depth-wise Convolution
+            Conv(hidden_dim, hidden_dim, k=k, s=s, p=p, g=hidden_dim, d=d, act=act),
+            # Squeeze-and-Excitation
+            SqueezeExcitation(hidden_dim, int(c2*se_ratio)),
+            # Point-wise Linear Projection
+            Conv(hidden_dim, c2, k=1, act=False)
+        ])
+        
+        self.block = nn.Sequential(*layers)
+
+    def forward(self, x):
+        # print(self.c2)
+        # print(f'x shape: {x.shape}')
+        if self.use_res_connect:
+            return x + self.block(x)
+        return self.block(x)
 
 class DFL(nn.Module):
     """
