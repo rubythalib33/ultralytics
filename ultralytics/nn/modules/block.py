@@ -24,6 +24,8 @@ class FusedMBConv(nn.Module):
         self.c2 = c2
         # Expansion Convolution
         self.conv_exp = Conv(c1, c2, k=k, s=s, p=p, g=g, d=d, act=act)
+
+        self.triplet_attention = TripletAttention()
         
         # Squeeze-and-Excitation
         self.se = SqueezeExcitation(c2, int(c2*se_ratio))
@@ -37,6 +39,7 @@ class FusedMBConv(nn.Module):
         shortcut = x
         x = self.conv_exp(x)
         # print(f'before se shape: {x.shape}')
+        x = self.triplet_attention(x)
         x = self.se(x)
         x = self.conv_pwl(x)
         if self.has_skip:
@@ -62,6 +65,8 @@ class MBConv(nn.Module):
             Conv(hidden_dim, hidden_dim, k=k, s=s, p=p, g=hidden_dim, d=d, act=act),
             # Squeeze-and-Excitation
             SqueezeExcitation(hidden_dim, int(c2*se_ratio)),
+            # add Triplet Attention
+            TripletAttention(),
             # Point-wise Linear Projection
             Conv(hidden_dim, c2, k=1, act=False)
         ])
@@ -394,3 +399,95 @@ class BottleneckCSP(nn.Module):
         y1 = self.cv3(self.m(self.cv1(x)))
         y2 = self.cv2(x)
         return self.cv4(self.act(self.bn(torch.cat((y1, y2), 1))))
+
+### Triplet attention
+class BasicConv(nn.Module):
+    def __init__(
+        self,
+        in_planes,
+        out_planes,
+        kernel_size,
+        stride=1,
+        padding=0,
+        dilation=1,
+        groups=1,
+        relu=True,
+        bn=True,
+        bias=False,
+    ):
+        super(BasicConv, self).__init__()
+        self.out_channels = out_planes
+        self.conv = nn.Conv2d(
+            in_planes,
+            out_planes,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+        )
+        self.bn = (
+            nn.BatchNorm2d(out_planes, eps=1e-5, momentum=0.01, affine=True)
+            if bn
+            else None
+        )
+        self.relu = nn.ReLU() if relu else None
+
+    def forward(self, x):
+        x = self.conv(x)
+        if self.bn is not None:
+            x = self.bn(x)
+        if self.relu is not None:
+            x = self.relu(x)
+        return x
+
+
+class ChannelPool(nn.Module):
+    def forward(self, x):
+        return torch.cat(
+            (torch.max(x, 1)[0].unsqueeze(1), torch.mean(x, 1).unsqueeze(1)), dim=1
+        )
+
+
+class SpatialGate(nn.Module):
+    def __init__(self):
+        super(SpatialGate, self).__init__()
+        kernel_size = 7
+        self.compress = ChannelPool()
+        self.spatial = BasicConv(
+            2, 1, kernel_size, stride=1, padding=(kernel_size - 1) // 2, relu=False
+        )
+
+    def forward(self, x):
+        x_compress = self.compress(x)
+        x_out = self.spatial(x_compress)
+        scale = torch.sigmoid_(x_out)
+        return x * scale
+
+
+class TripletAttention(nn.Module):
+    def __init__(
+        self,
+        no_spatial=False,
+    ):
+        super(TripletAttention, self).__init__()
+        self.ChannelGateH = SpatialGate()
+        self.ChannelGateW = SpatialGate()
+        self.no_spatial = no_spatial
+        if not no_spatial:
+            self.SpatialGate = SpatialGate()
+
+    def forward(self, x):
+        x_perm1 = x.permute(0, 2, 1, 3).contiguous()
+        x_out1 = self.ChannelGateH(x_perm1)
+        x_out11 = x_out1.permute(0, 2, 1, 3).contiguous()
+        x_perm2 = x.permute(0, 3, 2, 1).contiguous()
+        x_out2 = self.ChannelGateW(x_perm2)
+        x_out21 = x_out2.permute(0, 3, 2, 1).contiguous()
+        if not self.no_spatial:
+            x_out = self.SpatialGate(x)
+            x_out = (1 / 3) * (x_out + x_out11 + x_out21)
+        else:
+            x_out = (1 / 2) * (x_out11 + x_out21)
+        return x_out
