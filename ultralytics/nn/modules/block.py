@@ -12,7 +12,7 @@ from .transformer import TransformerBlock
 
 __all__ = ('DFL', 'HGBlock', 'HGStem', 'SPP', 'SPPF', 'C1', 'C2', 'C3', 'C2f', 'C3x', 'C3TR', 'C3Ghost',
            'GhostBottleneck', 'Bottleneck', 'BottleneckCSP', 'Proto', 'RepC3'
-           ,'FusedMBConv','MBConv')
+           ,'FusedMBConv','MBConv', 'GhostC2f')
 
 
 class FusedMBConv(nn.Module):
@@ -276,6 +276,18 @@ class C2f(nn.Module):
         y = list(self.cv1(x).split((self.c, self.c), 1))
         y.extend(m(y[-1]) for m in self.m)
         return self.cv2(torch.cat(y, 1))
+
+
+class GhostC2f(C2f):
+
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+        """Initialize CSP bottleneck layer with two convolutions with arguments ch_in, ch_out, number, shortcut, groups,
+        expansion.
+        """
+        super().__init__(c1, c2, n, shortcut, g, e)
+        self.cv1 = GhostConv(c1, 2 * self.c, 1, 1)
+        self.cv2 = GhostConv((2 + n) * self.c, c2, 1)
+        self.m = nn.ModuleList(GhostBottleneck(self.c, self.c, shortcut, g, e=1.0) for _ in range(n))
 
 
 class C3(nn.Module):
